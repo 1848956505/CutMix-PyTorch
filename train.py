@@ -28,7 +28,7 @@ model_names = sorted(name for name in models.__dict__
                      if name.islower() and not name.startswith("__")
                      and callable(models.__dict__[name]))
 
-parser = argparse.ArgumentParser(description='Cutmix PyTorch CIFAR-10, CIFAR-100 and ImageNet-1k Training')
+parser = argparse.ArgumentParser(description='Cutmix/Mixup PyTorch CIFAR-10, CIFAR-100 and ImageNet-1k Training')
 parser.add_argument('--net_type', default='pyramidnet', type=str,
                     help='networktype: resnet, and pyamidnet')
 parser.add_argument('-j', '--workers', default=4, type=int, metavar='N',
@@ -61,6 +61,13 @@ parser.add_argument('--beta', default=0, type=float,
                     help='hyperparameter beta')
 parser.add_argument('--cutmix_prob', default=0, type=float,
                     help='cutmix probability')
+# 新增：Mixup配置
+parser.add_argument('--mixup_alpha', default=1.0, type=float,
+                    help='Mixup Beta distribution alpha')
+parser.add_argument('--aug', default='baseline', type=str,
+                    choices=['baseline', 'cutmix', 'mixup'],
+                    help='augmentation method: baseline, cutmix, or mixup')
+
 
 parser.set_defaults(bottleneck=True)
 parser.set_defaults(verbose=True)
@@ -72,6 +79,24 @@ best_err5 = 100
 def main():
     global args, best_err1, best_err5
     args = parser.parse_args()
+
+    print("=" * 60)
+    print("Experiment Configuration")
+    print(f"Dataset       : {args.dataset}")
+    print(f"Network       : {args.net_type}")
+    print(f"Augmentation  : {args.aug}")
+    print(f"Epochs        : {args.epochs}")
+    print(f"Batch size    : {args.batch_size}")
+    print(f"Learning rate : {args.lr}")
+    print(f"Weight decay  : {args.weight_decay}")
+
+    if args.aug == 'cutmix':
+        print(f"CutMix beta   : {args.beta}")
+        print(f"CutMix prob   : {args.cutmix_prob}")
+    elif args.aug == 'mixup':
+        print(f"Mixup alpha   : {args.mixup_alpha}")
+
+    print("=" * 60)
 
     if args.dataset.startswith('cifar'):
         normalize = transforms.Normalize(mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
@@ -95,7 +120,7 @@ def main():
                 batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
             val_loader = torch.utils.data.DataLoader(
                 datasets.CIFAR100('../data', train=False, transform=transform_test),
-                batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+                batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
             numberofclass = 100
         elif args.dataset == 'cifar10':
             train_loader = torch.utils.data.DataLoader(
@@ -103,7 +128,7 @@ def main():
                 batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
             val_loader = torch.utils.data.DataLoader(
                 datasets.CIFAR10('../data', train=False, transform=transform_test),
-                batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
+                batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
             numberofclass = 10
         else:
             raise Exception('unknown dataset: {}'.format(args.dataset))
@@ -168,7 +193,7 @@ def main():
     print('the number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropyLoss().cuda()
+    criterion = nn.CrossEntropy().cuda()
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
@@ -196,10 +221,12 @@ def main():
         save_checkpoint({
             'epoch': epoch,
             'arch': args.net_type,
+            'augmentation': args.aug,
+            'args': vars(args),
             'state_dict': model.state_dict(),
             'best_err1': best_err1,
             'best_err5': best_err5,
-            'optimizer': optimizer.state_dict(),
+            'optimizer': optimizer.state_dict()
         }, is_best)
 
     print('Best accuracy (top-1 and 5 error):', best_err1, best_err5)
@@ -216,6 +243,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
     model.train()
 
     end = time.time()
+    # 记录学习率
     current_LR = get_learning_rate(optimizer)[0]
     for i, (input, target) in enumerate(train_loader):
         # measure data loading time
@@ -224,24 +252,60 @@ def train(train_loader, model, criterion, optimizer, epoch):
         input = input.cuda()
         target = target.cuda()
 
-        r = np.random.rand(1)
-        if args.beta > 0 and r < args.cutmix_prob:
-            # generate mixed sample
-            lam = np.random.beta(args.beta, args.beta)
-            rand_index = torch.randperm(input.size()[0]).cuda()
+        # ———————————————————— CutMix ————————————————————
+        if args.aug == 'cutmix':
+            r = np.random.rand()
+
+            if args.beta > 0 and r < args.cutmix_prob:
+                # generate mixed sample
+                # 1、从Beta分布中随机采样混合系数lambda
+                lam = np.random.beta(args.beta, args.beta)
+                # 2、当前打乱batch顺序
+                rand_index = torch.randperm(
+                    input.size(0),
+                    device=input.device
+                )
+                target_a = target   # 原顺序标签
+                target_b = target[rand_index]   # 打乱顺序后标签
+                # 3、根据混合系数，在图像上随机生成矩形框
+                bbx1, bby1, bbx2, bby2 = rand_bbox(input.size(), lam)
+                # 4、这里将B的矩形框直接覆盖到A的矩形框中
+                input[:, :, bbx1:bbx2, bby1:bby2] = input[rand_index, :, bbx1:bbx2, bby1:bby2]
+                # 5、重现计算lam，因为在确定矩形框时会遇到边界，导致矩形框面积缩小
+                lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (input.size()[-1] * input.size()[-2]))
+                # compute output
+                output = model(input)
+                # 这里没有显示构造标签，而是通过计算加权损失，巧妙的将标签进行融合
+                loss = criterion(output, target_a) * lam + criterion(output, target_b) * (1. - lam)
+            else:
+                # compute output
+                output = model(input)
+                loss = criterion(output, target)
+
+        # ———————————————————— Mixup ————————————————————
+        elif args.aug == 'mixup':
+            # 随机采样混合系数
+            lam = np.random.beta(
+                args.mixup_alpha,
+                args.mixup_alpha
+            )
+            # 打乱batch顺序
+            rand_index = torch.randperm(input.size(0), device=input.device)
+            # 取顺序标签和乱序的标签
             target_a = target
             target_b = target[rand_index]
-            bbx1, bby1, bbx2, bby2 = rand_bbox(input.size(), lam)
-            input[:, :, bbx1:bbx2, bby1:bby2] = input[rand_index, :, bbx1:bbx2, bby1:bby2]
-            # adjust lambda to exactly match pixel ratio
-            lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (input.size()[-1] * input.size()[-2]))
-            # compute output
-            output = model(input)
+            # 构造融合样本
+            mixed_input = lam * input + (1.0 - lam) * input[rand_index]
+
+            output = model(mixed_input)
+            # 这里也是，通过加权计算损失，来间接达到标签融合的效果
             loss = criterion(output, target_a) * lam + criterion(output, target_b) * (1. - lam)
+        # ———————————————————— Baseline ————————————————————
         else:
-            # compute output
             output = model(input)
             loss = criterion(output, target)
+
+
 
         # measure accuracy and record loss
         err1, err5 = accuracy(output.data, target, topk=(1, 5))
@@ -275,22 +339,24 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
     return losses.avg
 
-
+# 根据混合系数，随机生成矩形框
 def rand_bbox(size, lam):
     W = size[2]
     H = size[3]
+    # 公式： lam = 1 - （box area / W * H）比例
     cut_rat = np.sqrt(1. - lam)
     cut_w = np.int(W * cut_rat)
     cut_h = np.int(H * cut_rat)
 
-    # uniform
-    cx = np.random.randint(W)
+    # 这里是随机选择矩形框的中心点。
+    cx = np.random.randint(W)   # 从[0-W)中随机取整数
     cy = np.random.randint(H)
 
-    bbx1 = np.clip(cx - cut_w // 2, 0, W)
-    bby1 = np.clip(cy - cut_h // 2, 0, H)
-    bbx2 = np.clip(cx + cut_w // 2, 0, W)
-    bby2 = np.clip(cy + cut_h // 2, 0, H)
+    # 这里clip将bbx1限制在了0到W之间。主对角线上两个顶点的坐标
+    bbx1 = np.clip(cx - cut_w // 2, 0, W)   # 左上角的 x 坐标
+    bby1 = np.clip(cy - cut_h // 2, 0, H)   # 左上角的 y 坐标
+    bbx2 = np.clip(cx + cut_w // 2, 0, W)   # 右下角的 x 坐标
+    bby2 = np.clip(cy + cut_h // 2, 0, H)   # 右下角的 y 坐标
 
     return bbx1, bby1, bbx2, bby2
 
