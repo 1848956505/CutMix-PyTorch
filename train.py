@@ -193,7 +193,7 @@ def main():
     print('the number of model parameters: {}'.format(sum([p.data.nelement() for p in model.parameters()])))
 
     # define loss function (criterion) and optimizer
-    criterion = nn.CrossEntropy().cuda()
+    criterion = nn.CrossEntropyLoss().cuda()
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
@@ -345,8 +345,8 @@ def rand_bbox(size, lam):
     H = size[3]
     # 公式： lam = 1 - （box area / W * H）比例
     cut_rat = np.sqrt(1. - lam)
-    cut_w = np.int(W * cut_rat)
-    cut_h = np.int(H * cut_rat)
+    cut_w = int(W * cut_rat)
+    cut_h = int(H * cut_rat)
 
     # 这里是随机选择矩形框的中心点。
     cx = np.random.randint(W)   # 从[0-W)中随机取整数
@@ -372,7 +372,7 @@ def validate(val_loader, model, criterion, epoch):
 
     end = time.time()
     for i, (input, target) in enumerate(val_loader):
-        target = target.cuda()
+        input, target = input.cuda(), target.cuda()
 
         output = model(input)
         loss = criterion(output, target)
