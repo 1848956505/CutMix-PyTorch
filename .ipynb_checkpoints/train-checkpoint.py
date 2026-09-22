@@ -203,22 +203,47 @@ def main():
     cudnn.benchmark = True
 
     for epoch in range(0, args.epochs):
-
+    
         adjust_learning_rate(optimizer, epoch)
-
+    
         # train for one epoch
-        train_loss = train(train_loader, model, criterion, optimizer, epoch)
-
+        train_loss, train_err1, train_err5 = train(
+            train_loader,
+            model,
+            criterion,
+            optimizer,
+            epoch
+        )
+    
         # evaluate on validation set
-        err1, err5, val_loss = validate(val_loader, model, criterion, epoch)
-
+        val_loss, err1, err5 = validate(
+            val_loader,
+            model,
+            criterion,
+            epoch
+        )
+    
         # remember best prec@1 and save checkpoint
         is_best = err1 <= best_err1
         best_err1 = min(err1, best_err1)
+    
         if is_best:
             best_err5 = err5
-
-        print('Current best accuracy (top-1 and 5 error):', best_err1, best_err5)
+    
+        current_lr = optimizer.param_groups[0]['lr']
+    
+        # 每个 epoch 只永久打印一次
+        print(
+            f"Epoch [{epoch + 1:3d}/{args.epochs}] | "
+            f"LR {current_lr:.5f} | "
+            f"Train Loss {train_loss:.4f} | "
+            f"Train Acc@1 {100.0 - train_err1:.2f}% | "
+            f"Val Loss {val_loss:.4f} | "
+            f"Val Acc@1 {100.0 - err1:.2f}% | "
+            f"Val Acc@5 {100.0 - err5:.2f}% | "
+            f"Best Acc@1 {100.0 - best_err1:.2f}%"
+        )
+    
         save_checkpoint({
             'epoch': epoch,
             'arch': args.net_type,
@@ -244,8 +269,6 @@ def train(train_loader, model, criterion, optimizer, epoch):
     model.train()
 
     end = time.time()
-    # 记录学习率
-    current_LR = get_learning_rate(optimizer)[0]
     # 使用tqdm进度条
     pbar = tqdm(
         train_loader,
@@ -338,7 +361,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         batch_time.update(time.time() - end)
         end = time.time()
 
-    return losses.avg, top1.avg, top5.avg
+    return top1.avg, top5.avg, losses.avg
 
 # 根据混合系数，随机生成矩形框
 def rand_bbox(size, lam):
@@ -361,7 +384,7 @@ def rand_bbox(size, lam):
 
     return bbx1, bby1, bbx2, bby2
 
-
+@torch.no_grad()
 def validate(val_loader, model, criterion, epoch):
     batch_time = AverageMeter()
     losses = AverageMeter()
