@@ -255,7 +255,10 @@ def main():
             'optimizer': optimizer.state_dict()
         }, is_best)
 
-    print('Best accuracy (top-1 and 5 error):', best_err1, best_err5)
+    print(
+        f"Best Val Acc@1: {100.0 - best_err1:.2f}% | "
+        f"Val Acc@5: {100.0 - best_err5:.2f}%"
+    )
 
 
 def train(train_loader, model, criterion, optimizer, epoch):
