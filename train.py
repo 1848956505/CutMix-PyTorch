@@ -361,7 +361,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
         batch_time.update(time.time() - end)
         end = time.time()
 
-    return top1.avg, top5.avg, losses.avg
+    return losses.avg, top1.avg, top5.avg
 
 # 根据混合系数，随机生成矩形框
 def rand_bbox(size, lam):
