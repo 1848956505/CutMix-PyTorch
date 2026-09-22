@@ -289,7 +289,7 @@ def train(train_loader, model, criterion, optimizer, epoch):
                 args.mixup_alpha,
                 args.mixup_alpha
             )
-            # 打乱batch顺序
+            # 打乱batch的顺序
             rand_index = torch.randperm(input.size(0), device=input.device)
             # 取顺序标签和乱序的标签
             target_a = target
