@@ -17,6 +17,7 @@ import torchvision.datasets as datasets
 import torchvision.models as models
 import resnet as RN
 import pyramidnet as PYRM
+import preact_resnet as PARN
 import utils
 import numpy as np
 
@@ -68,6 +69,13 @@ parser.add_argument('--mixup_alpha', default=1.0, type=float,
 parser.add_argument('--aug', default='baseline', type=str,
                     choices=['baseline', 'cutmix', 'mixup'],
                     help='augmentation method: baseline, cutmix, or mixup')
+parser.add_argument(
+        '--recipe',
+        default='cutmix',
+        type=str,
+        choices=['cutmix', 'mixup'],
+        help='training recipe: cutmix or mixup'
+    )
 
 
 parser.set_defaults(bottleneck=True)
@@ -83,6 +91,7 @@ def main():
 
     print("=" * 60)
     print("Experiment Configuration")
+    print(f"Recipe        : {args.recipe}")
     print(f"Dataset       : {args.dataset}")
     print(f"Network       : {args.net_type}")
     print(f"Augmentation  : {args.aug}")
@@ -90,6 +99,7 @@ def main():
     print(f"Batch size    : {args.batch_size}")
     print(f"Learning rate : {args.lr}")
     print(f"Weight decay  : {args.weight_decay}")
+    
 
     if args.aug == 'cutmix':
         print(f"CutMix beta   : {args.beta}")
@@ -100,8 +110,19 @@ def main():
     print("=" * 60)
 
     if args.dataset.startswith('cifar'):
-        normalize = transforms.Normalize(mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
-                                         std=[x / 255.0 for x in [63.0, 62.1, 66.7]])
+            # Mixup实验CIFAR-10配置
+        if args.recipe == 'mixup' and args.dataset == 'cifar10':
+            normalize = transforms.Normalize(
+                mean=(0.4914, 0.4822, 0.4465),
+                std=(0.2023, 0.1994, 0.2010)
+            )
+    
+        # 保留CutMix/PyramidNet原有配置
+        else:
+            normalize = transforms.Normalize(
+                mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
+                std=[x / 255.0 for x in [63.0, 62.1, 66.7]]
+            )
 
         transform_train = transforms.Compose([
             transforms.RandomCrop(32, padding=4),
@@ -185,6 +206,10 @@ def main():
     elif args.net_type == 'pyramidnet':
         model = PYRM.PyramidNet(args.dataset, args.depth, args.alpha, numberofclass,
                                 args.bottleneck)
+    elif args.net_type == 'preact_resnet18':
+        model = PARN.preact_resnet18(
+            num_classes=numberofclass
+        )
     else:
         raise Exception('unknown network architecture: {}'.format(args.net_type))
 
@@ -198,7 +223,7 @@ def main():
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
-                                weight_decay=args.weight_decay, nesterov=True)
+                                weight_decay=args.weight_decay, nesterov=(args.recipe == 'cutmix'))
 
     cudnn.benchmark = True
 
@@ -232,7 +257,7 @@ def main():
     
         current_lr = optimizer.param_groups[0]['lr']
     
-        # 每个 epoch 只永久打印一次
+        
         print(
             f"Epoch [{epoch + 1:3d}/{args.epochs}] | "
             f"LR {current_lr:.5f} | "
@@ -291,32 +316,61 @@ def train(train_loader, model, criterion, optimizer, epoch):
         # ———————————————————— CutMix ————————————————————
         if args.aug == 'cutmix':
             r = np.random.rand()
-
+        
             if args.beta > 0 and r < args.cutmix_prob:
-                # generate mixed sample
-                # 1、从Beta分布中随机采样混合系数lambda
+                # 1. 从 Beta 分布中采样混合系数
                 lam = np.random.beta(args.beta, args.beta)
-                # 2、当前打乱batch顺序
+        
+                # 2. 打乱 batch
                 rand_index = torch.randperm(
                     input.size(0),
                     device=input.device
                 )
-                target_a = target   # 原顺序标签
-                target_b = target[rand_index]   # 打乱顺序后标签
-                # 3、根据混合系数，在图像上随机生成矩形框
+        
+                target_a = target
+                target_b = target[rand_index]
+        
+                # 3. 随机生成 CutMix 区域
                 bbx1, bby1, bbx2, bby2 = rand_bbox(input.size(), lam)
-                # 4、这里将B的矩形框直接覆盖到A的矩形框中
-                input[:, :, bbx1:bbx2, bby1:bby2] = input[rand_index, :, bbx1:bbx2, bby1:bby2]
-                # 5、重现计算lam，因为在确定矩形框时会遇到边界，导致矩形框面积缩小
-                lam = 1 - ((bbx2 - bbx1) * (bby2 - bby1) / (input.size()[-1] * input.size()[-2]))
-                # compute output
+        
+                # 4. 用另一张图像的区域进行替换
+                input[:, :, bbx1:bbx2, bby1:bby2] = \
+                    input[rand_index, :, bbx1:bbx2, bby1:bby2]
+        
+                # 5. 根据实际裁剪面积重新计算 lambda
+                lam = 1 - (
+                    (bbx2 - bbx1) * (bby2 - bby1)
+                    / (input.size()[-1] * input.size()[-2])
+                )
+        
+                # forward
                 output = model(input)
-                # 这里没有显示构造标签，而是通过计算加权损失，巧妙的将标签进行融合
-                loss = criterion(output, target_a) * lam + criterion(output, target_b) * (1. - lam)
+        
+                # CutMix 加权损失
+                loss = (
+                    criterion(output, target_a) * lam
+                    + criterion(output, target_b) * (1.0 - lam)
+                )
+        
+                # CutMix 加权训练准确率
+                err1, err5 = mixed_accuracy(
+                    output.data,
+                    target_a,
+                    target_b,
+                    lam,
+                    topk=(1, 5)
+                )
+        
             else:
-                # compute output
+                # 本 batch 不执行 CutMix
                 output = model(input)
                 loss = criterion(output, target)
+        
+                err1, err5 = accuracy(
+                    output.data,
+                    target,
+                    topk=(1, 5)
+                )
 
         # ———————————————————— Mixup ————————————————————
         elif args.aug == 'mixup':
@@ -336,15 +390,25 @@ def train(train_loader, model, criterion, optimizer, epoch):
             output = model(mixed_input)
             # 这里也是，通过加权计算损失，来间接达到标签融合的效果
             loss = criterion(output, target_a) * lam + criterion(output, target_b) * (1. - lam)
+
+            err1, err5 = mixed_accuracy(
+                output.data,
+                target_a,
+                target_b,
+                lam,
+                topk=(1, 5)
+            )
+            
         # ———————————————————— Baseline ————————————————————
         else:
             output = model(input)
             loss = criterion(output, target)
 
-
-
-        # measure accuracy and record loss
-        err1, err5 = accuracy(output.data, target, topk=(1, 5))
+            err1, err5 = accuracy(
+                output.data,
+                target,
+                topk=(1, 5)
+            )
 
         losses.update(loss.item(), input.size(0))
         top1.update(err1.item(), input.size(0))
@@ -499,6 +563,16 @@ def accuracy(output, target, topk=(1,)):
 
     return res
 
+# 新增：Mixup实验准确率计算
+def mixed_accuracy(output, target_a, target_b, lam, topk=(1, 5)):
+    err_a = accuracy(output, target_a, topk)
+    err_b = accuracy(output, target_b, topk)
+
+    return [
+        lam * a + (1.0 - lam) * b
+        for a, b in zip(err_a, err_b)
+    ]
+    
 
 if __name__ == '__main__':
     main()

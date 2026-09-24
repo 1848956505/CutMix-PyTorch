@@ -3,3 +3,4 @@ __pycache__/
 runs/
 train_nsml.py
 requirements.txt
+.ipynb_checkpoints/
