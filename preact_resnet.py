@@ -60,6 +60,7 @@ class PreActResNet(nn.Module):
         self.in_planes = 64
 
         self.conv1 = conv3x3(3, 64)
+        self.bn1 = nn.BatchNorm2d(64)
 
         self.layer1 = self._make_layer(
             block, 64, num_blocks[0], stride=1
@@ -97,7 +98,8 @@ class PreActResNet(nn.Module):
     def forward(self, x):
 
         out = self.conv1(x)
-
+        out = self.bn1(out)
+        out = F.relu(out)
         out = self.layer1(out)
         out = self.layer2(out)
         out = self.layer3(out)

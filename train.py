@@ -76,7 +76,12 @@ parser.add_argument(
         choices=['cutmix', 'mixup'],
         help='training recipe: cutmix or mixup'
     )
-
+parser.add_argument(
+        '--seed',
+        default=20170922,
+        type=int,
+        help='random seed'
+    )
 
 parser.set_defaults(bottleneck=True)
 parser.set_defaults(verbose=True)
@@ -88,6 +93,10 @@ best_err5 = 100
 def main():
     global args, best_err1, best_err5
     args = parser.parse_args()
+
+    torch.manual_seed(args.seed)
+    torch.cuda.manual_seed_all(args.seed)
+    np.random.seed(args.seed)
 
     print("=" * 60)
     print("Experiment Configuration")
@@ -146,10 +155,10 @@ def main():
             numberofclass = 100
         elif args.dataset == 'cifar10':
             train_loader = torch.utils.data.DataLoader(
-                datasets.CIFAR10('../data', train=True, download=True, transform=transform_train),
+                datasets.CIFAR10('/root/autodl-tmp/CIFAR_10', train=True, download=True, transform=transform_train),
                 batch_size=args.batch_size, shuffle=True, num_workers=args.workers, pin_memory=True)
             val_loader = torch.utils.data.DataLoader(
-                datasets.CIFAR10('../data', train=False, transform=transform_test),
+                datasets.CIFAR10('/root/autodl-tmp/CIFAR_10', train=False, transform=transform_test),
                 batch_size=args.batch_size, shuffle=False, num_workers=args.workers, pin_memory=True)
             numberofclass = 10
         else:
