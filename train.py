@@ -22,6 +22,7 @@ import model.preact_resnet as PARN
 import model.wide_resnet as WRN
 import model.dense_net as DN
 
+from randaugment_utils import Cutout
 import utils
 import numpy as np
 
@@ -67,17 +68,17 @@ parser.add_argument('--beta', default=0, type=float,
                     help='hyperparameter beta')
 parser.add_argument('--cutmix_prob', default=0, type=float,
                     help='cutmix probability')
-# 新增：Mixup配置
+# 新增：Mixup配置、RandAugment配置
 parser.add_argument('--mixup_alpha', default=1.0, type=float,
                     help='Mixup Beta distribution alpha')
 parser.add_argument('--aug', default='baseline', type=str,
-                    choices=['baseline', 'cutmix', 'mixup'],
-                    help='augmentation method: baseline, cutmix, or mixup')
+                    choices=['baseline', 'cutmix', 'mixup', 'randaugment'],
+                    help='augmentation method: baseline, cutmix, or mixup or randaugment')
 parser.add_argument(
         '--recipe',
         default='cutmix',
         type=str,
-        choices=['cutmix', 'mixup'],
+        choices=['cutmix', 'mixup','randaugment'],
         help='training recipe: cutmix or mixup'
     )
 parser.add_argument(
@@ -91,6 +92,28 @@ parser.add_argument(
     '--amp',
     action = "store_true",
     help = 'use automatic mixed precision'
+)
+
+# 新增randaugemnt参数：
+parser.add_argument(
+    '--randaug_n',
+    default=3,
+    type=int,
+    help='number of RandAugment operations'
+)
+
+parser.add_argument(
+    '--randaug_m',
+    default=5,
+    type=int,
+    help='RandAugment magnitude [0, 30]'
+)
+
+parser.add_argument(
+    '--cutout_length',
+    default=16,
+    type=int,
+    help='Cutout mask length for RandAugment recipe'
 )
 
 parser.set_defaults(bottleneck=True)
@@ -125,35 +148,98 @@ def main():
         print(f"CutMix prob   : {args.cutmix_prob}")
     elif args.aug == 'mixup':
         print(f"Mixup alpha   : {args.mixup_alpha}")
+    elif args.recipe == 'randaugment':
+        print(f"RandAugment N  : {args.randaug_n}")
+        print(f"RandAugment M  : {args.randaug_m}")
+        print(f"Cutout length  : {args.cutout_length}")
+        print("LR schedule    : cosine")
 
     print("=" * 60)
 
     if args.dataset.startswith('cifar'):
-            # Mixup实验CIFAR-10配置
-        if args.recipe == 'mixup':
+    
+        # ==================== RandAugment recipe ====================
+        if args.recipe == 'randaugment':
+    
+            normalize = transforms.Normalize(
+                mean=(0.4914, 0.4822, 0.4465),
+                std=(0.2470, 0.2435, 0.2616)
+            )
+    
+            train_transforms = []
+    
+            # RandAugment论文：
+            # CIFAR-10 + WRN-28-10 -> N=3, M=5
+            if args.aug == 'randaugment':
+                train_transforms.append(
+                    transforms.RandAugment(
+                        num_ops=args.randaug_n,
+                        magnitude=args.randaug_m,
+                        num_magnitude_bins=31,
+                        fill=(125, 123, 114)
+                    )
+                )
+    
+            # RandAugment论文的默认CIFAR增强：
+            # pad-and-crop + horizontal flip + Cutout
+            train_transforms.extend([
+                transforms.RandomCrop(
+                    32,
+                    padding=4,
+                    fill=(125, 123, 114)
+                ),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+                Cutout(args.cutout_length),
+            ])
+    
+            transform_train = transforms.Compose(train_transforms)
+    
+            transform_test = transforms.Compose([
+                transforms.ToTensor(),
+                normalize
+            ])
+    
+        # ==================== Mixup recipe ====================
+        elif args.recipe == 'mixup':
+    
             normalize = transforms.Normalize(
                 mean=(0.4914, 0.4822, 0.4465),
                 std=(0.2023, 0.1994, 0.2010)
             )
     
-        # 保留CutMix/PyramidNet原有配置
+            transform_train = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ])
+    
+            transform_test = transforms.Compose([
+                transforms.ToTensor(),
+                normalize
+            ])
+    
+        # ==================== CutMix recipe ====================
         else:
+    
             normalize = transforms.Normalize(
                 mean=[x / 255.0 for x in [125.3, 123.0, 113.9]],
                 std=[x / 255.0 for x in [63.0, 62.1, 66.7]]
             )
-
-        transform_train = transforms.Compose([
-            transforms.RandomCrop(32, padding=4),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ])
-
-        transform_test = transforms.Compose([
-            transforms.ToTensor(),
-            normalize
-        ])
+    
+            transform_train = transforms.Compose([
+                transforms.RandomCrop(32, padding=4),
+                transforms.RandomHorizontalFlip(),
+                transforms.ToTensor(),
+                normalize,
+            ])
+    
+            transform_test = transforms.Compose([
+                transforms.ToTensor(),
+                normalize
+            ])
 
         if args.dataset == 'cifar100':
             train_loader = torch.utils.data.DataLoader(
@@ -251,7 +337,8 @@ def main():
 
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
-                                weight_decay=args.weight_decay, nesterov=(args.recipe == 'cutmix'))
+                                weight_decay=args.weight_decay, 
+                                nesterov=(args.recipe in ['cutmix','randaugment']))
     scaler = torch.amp.GradScaler(
     'cuda',
     enabled=args.amp
@@ -261,7 +348,13 @@ def main():
 
     for epoch in range(0, args.epochs):
     
-        adjust_learning_rate(optimizer, epoch)
+        # Mixup / CutMix：
+        # 每个 epoch 调整学习率
+        if args.recipe != 'randaugment':
+            adjust_learning_rate(
+                optimizer,
+                epoch
+            )
     
         # train for one epoch
         train_loss, train_err1, train_err5 = train(
@@ -340,6 +433,16 @@ def train(train_loader, model, criterion, optimizer, epoch, scaler):
     )
 
     for i, (input, target) in enumerate(pbar):
+        
+        # RandAugment使用per-iteration cosine learning rate
+        if args.recipe == 'randaugment':
+            adjust_learning_rate(
+                optimizer,
+                epoch,
+                iteration=i,
+                batches_per_epoch=len(train_loader)
+            )
+            
         # measure data loading time
         data_time.update(time.time() - end)
 
@@ -467,6 +570,16 @@ def train(train_loader, model, criterion, optimizer, epoch, scaler):
         optimizer.zero_grad()
 
         scaler.scale(loss).backward()
+
+        # RandAugment / AutoAugment WRN recipe
+        if args.recipe == 'randaugment':
+            scaler.unscale_(optimizer)
+        
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=5.0
+            )
+        
         scaler.step(optimizer)
         scaler.update()
 
@@ -576,15 +689,64 @@ class AverageMeter(object):
         self.avg = self.sum / self.count
 
 
-def adjust_learning_rate(optimizer, epoch):
-    """Sets the learning rate to the initial LR decayed by 10 every 30 epochs"""
-    if args.dataset.startswith('cifar'):
-        lr = args.lr * (0.1 ** (epoch // (args.epochs * 0.5))) * (0.1 ** (epoch // (args.epochs * 0.75)))
-    elif args.dataset == ('imagenet'):
+def adjust_learning_rate(
+    optimizer,
+    epoch,
+    iteration=0,
+    batches_per_epoch=None
+):
+
+    # ==================== RandAugment ====================
+    if args.recipe == 'randaugment':
+
+        if batches_per_epoch is None:
+            raise ValueError(
+                "batches_per_epoch is required for RandAugment"
+            )
+
+        current_step = (
+            epoch * batches_per_epoch
+            + iteration
+        )
+
+        total_steps = (
+            args.epochs
+            * batches_per_epoch
+        )
+
+        lr = 0.5 * args.lr * (
+            1.0
+            + np.cos(
+                np.pi
+                * current_step
+                / total_steps
+            )
+        )
+
+    # ==================== Mixup / CutMix CIFAR ====================
+    elif args.dataset.startswith('cifar'):
+
+        lr = (
+            args.lr
+            * (0.1 ** (
+                epoch // (args.epochs * 0.5)
+            ))
+            * (0.1 ** (
+                epoch // (args.epochs * 0.75)
+            ))
+        )
+
+    # ==================== ImageNet ====================
+    elif args.dataset == 'imagenet':
+
         if args.epochs == 300:
-            lr = args.lr * (0.1 ** (epoch // 75))
+            lr = args.lr * (
+                0.1 ** (epoch // 75)
+            )
         else:
-            lr = args.lr * (0.1 ** (epoch // 30))
+            lr = args.lr * (
+                0.1 ** (epoch // 30)
+            )
 
     for param_group in optimizer.param_groups:
         param_group['lr'] = lr
