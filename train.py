@@ -15,9 +15,13 @@ import torch.utils.data.distributed
 import torchvision.transforms as transforms
 import torchvision.datasets as datasets
 import torchvision.models as models
-import resnet as RN
-import pyramidnet as PYRM
-import preact_resnet as PARN
+
+import model.resnet as RN
+import model.pyramidnet as PYRM
+import model.preact_resnet as PARN
+import model.wide_resnet as WRN
+import model.dense_net as DN
+
 import utils
 import numpy as np
 
@@ -83,6 +87,12 @@ parser.add_argument(
         help='random seed'
     )
 
+parser.add_argument(
+    '--amp',
+    action = "store_true",
+    help = 'use automatic mixed precision'
+)
+
 parser.set_defaults(bottleneck=True)
 parser.set_defaults(verbose=True)
 
@@ -120,7 +130,7 @@ def main():
 
     if args.dataset.startswith('cifar'):
             # Mixup实验CIFAR-10配置
-        if args.recipe == 'mixup' and args.dataset == 'cifar10':
+        if args.recipe == 'mixup':
             normalize = transforms.Normalize(
                 mean=(0.4914, 0.4822, 0.4465),
                 std=(0.2023, 0.1994, 0.2010)
@@ -210,6 +220,7 @@ def main():
         raise Exception('unknown dataset: {}'.format(args.dataset))
 
     print("=> creating model '{}'".format(args.net_type))
+    # 这里新增模型
     if args.net_type == 'resnet':
         model = RN.ResNet(args.dataset, args.depth, numberofclass, args.bottleneck)  # for ResNet
     elif args.net_type == 'pyramidnet':
@@ -218,6 +229,14 @@ def main():
     elif args.net_type == 'preact_resnet18':
         model = PARN.preact_resnet18(
             num_classes=numberofclass
+        )
+    elif args.net_type == 'wide_resnet28_10':
+        model = WRN.wide_resnet28_10(
+            num_classes = numberofclass
+        )
+    elif args.net_type == 'densenet_bc190':
+        model = DN.dense_net_bc190(
+            num_classes = numberofclass
         )
     else:
         raise Exception('unknown network architecture: {}'.format(args.net_type))
@@ -233,6 +252,10 @@ def main():
     optimizer = torch.optim.SGD(model.parameters(), args.lr,
                                 momentum=args.momentum,
                                 weight_decay=args.weight_decay, nesterov=(args.recipe == 'cutmix'))
+    scaler = torch.amp.GradScaler(
+    'cuda',
+    enabled=args.amp
+)
 
     cudnn.benchmark = True
 
@@ -246,7 +269,8 @@ def main():
             model,
             criterion,
             optimizer,
-            epoch
+            epoch,
+            scaler
         )
     
         # evaluate on validation set
@@ -295,7 +319,7 @@ def main():
     )
 
 
-def train(train_loader, model, criterion, optimizer, epoch):
+def train(train_loader, model, criterion, optimizer, epoch, scaler):
     batch_time = AverageMeter()
     data_time = AverageMeter()
     losses = AverageMeter()
@@ -351,24 +375,29 @@ def train(train_loader, model, criterion, optimizer, epoch):
                     (bbx2 - bbx1) * (bby2 - bby1)
                     / (input.size()[-1] * input.size()[-2])
                 )
-        
-                # forward
-                output = model(input)
-        
-                # CutMix 加权损失
-                loss = (
-                    criterion(output, target_a) * lam
-                    + criterion(output, target_b) * (1.0 - lam)
-                )
-        
-                # CutMix 加权训练准确率
-                err1, err5 = mixed_accuracy(
-                    output.data,
-                    target_a,
-                    target_b,
-                    lam,
-                    topk=(1, 5)
-                )
+
+                with torch.autocast(
+                    device_type='cuda',
+                    dtype=torch.float16,
+                    enabled=args.amp
+                ):
+                    # forward
+                    output = model(input)
+            
+                    # CutMix 加权损失
+                    loss = (
+                        criterion(output, target_a) * lam
+                        + criterion(output, target_b) * (1.0 - lam)
+                    )
+            
+                    # CutMix 加权训练准确率
+                    err1, err5 = mixed_accuracy(
+                        output.data,
+                        target_a,
+                        target_b,
+                        lam,
+                        topk=(1, 5)
+                    )
         
             else:
                 # 本 batch 不执行 CutMix
@@ -396,28 +425,39 @@ def train(train_loader, model, criterion, optimizer, epoch):
             # 构造融合样本
             mixed_input = lam * input + (1.0 - lam) * input[rand_index]
 
-            output = model(mixed_input)
-            # 这里也是，通过加权计算损失，来间接达到标签融合的效果
-            loss = criterion(output, target_a) * lam + criterion(output, target_b) * (1. - lam)
-
-            err1, err5 = mixed_accuracy(
-                output.data,
-                target_a,
-                target_b,
-                lam,
-                topk=(1, 5)
-            )
+            with torch.autocast(
+                device_type='cuda',
+                dtype=torch.float16,
+                enabled=args.amp
+            ):
+                output = model(mixed_input)
+                # 这里也是，通过加权计算损失，来间接达到标签融合的效果
+                loss = criterion(output, target_a) * lam + criterion(output, target_b) * (1. - lam)
+    
+                err1, err5 = mixed_accuracy(
+                    output.data,
+                    target_a,
+                    target_b,
+                    lam,
+                    topk=(1, 5)
+                )
             
         # ———————————————————— Baseline ————————————————————
         else:
-            output = model(input)
-            loss = criterion(output, target)
-
-            err1, err5 = accuracy(
-                output.data,
-                target,
-                topk=(1, 5)
-            )
+            with torch.autocast(
+                device_type='cuda',
+                dtype=torch.float16,
+                enabled=args.amp
+            ):
+                
+                output = model(input)
+                loss = criterion(output, target)
+    
+                err1, err5 = accuracy(
+                    output.data,
+                    target,
+                    topk=(1, 5)
+                )
 
         losses.update(loss.item(), input.size(0))
         top1.update(err1.item(), input.size(0))
@@ -425,8 +465,10 @@ def train(train_loader, model, criterion, optimizer, epoch):
 
         # compute gradient and do SGD step
         optimizer.zero_grad()
-        loss.backward()
-        optimizer.step()
+
+        scaler.scale(loss).backward()
+        scaler.step(optimizer)
+        scaler.update()
 
         pbar.set_postfix(
             loss=f"{losses.avg:.4f}",
