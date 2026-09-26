@@ -1,0 +1,22 @@
+{
+  "group": "g2",
+  "data_root": "/root/autodl-tmp/CIFAR_100",
+  "output_dir": "cross_layer/results",
+  "seed": 20170922,
+  "workers": 4,
+  "source_batch": 32,
+  "repeats": 4,
+  "max_updates": 5000,
+  "eval_every": 1000,
+  "log_every": 100,
+  "lr": 0.1,
+  "momentum": 0.9,
+  "weight_decay": 0.0005,
+  "ra_n": 3,
+  "fixed_m": 5,
+  "role_b_m": 9,
+  "m_min": 3,
+  "m_max": 9,
+  "amp": true,
+  "test_at_end": false
+}
